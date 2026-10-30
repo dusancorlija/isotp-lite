@@ -1,0 +1,55 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  host:
+    name: host / ${{ matrix.cc }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build with sanitizers
+        env:
+          CC: ${{ matrix.cc }}
+        run: |
+          cmake -S . -B build -DISOTP_WERROR=ON -DCMAKE_BUILD_TYPE=Debug \
+                -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-sanitize-recover=all"
+          cmake --build build -j
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+      - name: Examples
+        run: |
+          ./build/uds_download | tail -2
+          ./build/throughput
+
+  cortex-m:
+    name: cortex-m / code size
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install arm-none-eabi-gcc
+        run: sudo apt-get update && sudo apt-get install -y gcc-arm-none-eabi
+      - name: Compile isotp.c
+        run: |
+          set -e
+          echo "### Code size of isotp.c (\`-Os\`, bytes)" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Target | .text | RAM per link |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---:|---:|" >> "$GITHUB_STEP_SUMMARY"
+          for cpu in cortex-m0plus cortex-m4 cortex-m7; do
+            arm-none-eabi-gcc -mcpu=$cpu -mthumb -Os -std=c99 -Wall -Wextra -Werror \
+              -ffunction-sections -Iinclude -c src/isotp.c -o isotp.o
+            text=$(arm-none-eabi-size -A isotp.o | awk '/^\.text/ {s += $2} END {print s}')
+            echo '#include "isotp.h"
+            unsigned link_size = sizeof(isotp_link_t);' > sz.c
+            arm-none-eabi-gcc -mcpu=$cpu -mthumb -Os -Iinclude -S sz.c -o sz.s
+            ram=$(awk '/\.word/ {print $2; exit}' sz.s)
+            echo "| $cpu | $text | $ram |" >> "$GITHUB_STEP_SUMMARY"
+          done
+          cat "$GITHUB_STEP_SUMMARY"
