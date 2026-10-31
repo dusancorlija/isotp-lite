@@ -3,7 +3,8 @@
  *
  * Sends a 4095-byte message tester -> ECU over a simulated 500 kbit/s bus
  * for a grid of receiver settings and prints transfer time, goodput and
- * the bus load the transfer causes (what is left for other traffic).
+ * the bus load the transfer causes (what is left for other traffic), then
+ * the same message over CAN FD with different TX_DL and data bit rates.
  */
 #include <stdio.h>
 #include <string.h>
@@ -13,12 +14,14 @@
 
 static uint8_t msg[ISOTP_MAX_LEN], rx_t[ISOTP_MAX_LEN], rx_e[ISOTP_MAX_LEN];
 
-static void measure(uint8_t bs, uint8_t st, int pad, double *ms, double *kbps, double *load)
+/* data_bitrate 0 = classic CAN bus. */
+static void measure_dl(uint8_t bs, uint8_t st, int pad, uint8_t tx_dl, uint32_t data_bitrate, double *ms,
+                       double *kbps, double *load)
 {
     vbus_t bus;
     isotp_link_t tester, ecu;
-    vbus_init(&bus, 500000);
-    isotp_config_t a = { .tx_id = 0x7E0, .rx_buf = rx_t, .rx_cap = sizeof(rx_t),
+    vbus_init_fd(&bus, 500000, data_bitrate);
+    isotp_config_t a = { .tx_id = 0x7E0, .rx_buf = rx_t, .rx_cap = sizeof(rx_t), .tx_dl = tx_dl,
                          .padding = pad ? 0xCC : ISOTP_NO_PADDING };
     isotp_config_t b = { .tx_id = 0x7E8, .rx_buf = rx_e, .rx_cap = sizeof(rx_e), .block_size = bs,
                          .st_min = st, .padding = pad ? 0xCC : ISOTP_NO_PADDING };
@@ -37,6 +40,11 @@ static void measure(uint8_t bs, uint8_t st, int pad, double *ms, double *kbps, d
     *ms = dt / 1000.0;
     *kbps = sizeof(msg) * 8.0 / dt * 1000.0;
     *load = 100.0 * (double)bus.busy_us / dt; /* bus load caused by the transfer */
+}
+
+static void measure(uint8_t bs, uint8_t st, int pad, double *ms, double *kbps, double *load)
+{
+    measure_dl(bs, st, pad, 8, 0, ms, kbps, load);
 }
 
 int main(void)
@@ -62,5 +70,21 @@ int main(void)
     measure(0, 0, 1, &ms0, &k0, &e0);
     measure(0, 0, 0, &ms1, &k1, &e1);
     printf("\nPadding off saves only the final short frame: %.2f ms -> %.2f ms.\n", ms0, ms1);
+
+    const struct { uint8_t dl; uint32_t dbr; const char *bus; } fd[] = {
+        { 8, 0, "classic 500k" },  { 8, 2000000, "FD 500k/2M" },  { 16, 2000000, "FD 500k/2M" },
+        { 64, 2000000, "FD 500k/2M" }, { 64, 5000000, "FD 500k/5M" },
+    };
+    printf("\n4095-byte message, receiver BS 0, STmin 0.\n\n");
+    printf("| Bus | TX_DL | Frames | Transfer time | Goodput | Bus load |\n");
+    printf("|---|---:|---:|---:|---:|---:|\n");
+    for (size_t i = 0; i < sizeof(fd) / sizeof(fd[0]); i++) {
+        double ms, kbps, load;
+        measure_dl(0, 0, 1, fd[i].dl, fd[i].dbr, &ms, &kbps, &load);
+        const unsigned ff = fd[i].dl - 2u, cf = fd[i].dl - 1u;
+        const unsigned frames = 2u + (sizeof(msg) - ff + cf - 1u) / cf; /* FF + FC + CFs */
+        printf("| %s | %u | %u | %.1f ms | %.1f kbit/s | %.1f %% |\n", fd[i].bus, fd[i].dl, frames, ms, kbps,
+               load);
+    }
     return 0;
 }

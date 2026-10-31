@@ -1,11 +1,14 @@
 /*
- * isotp.h - ISO 15765-2 (ISO-TP) transport layer for classic CAN.
+ * isotp.h - ISO 15765-2 (ISO-TP) transport layer for classic CAN and CAN FD.
  *
  * - One link = one pair of CAN identifiers (normal addressing), full duplex:
  *   a link can send and receive a message at the same time.
  * - No dynamic memory, no global state, no OS dependency. The caller owns
  *   the buffers and supplies the time in microseconds.
  * - Messages up to 4095 bytes (12-bit first-frame length).
+ * - Classic CAN (8-byte frames) and CAN FD (up to 64-byte frames) as in
+ *   ISO 15765-2:2016: TX_DL is configured per link, RX_DL is taken from each
+ *   received first frame, so a link receives classic and FD peers alike.
  * - Supports block size, STmin (ms and 100 us ranges), FC.WAIT, FC.OVFLW,
  *   N_Bs / N_Cr timeouts, sequence-number checking and frame padding.
  *
@@ -33,8 +36,16 @@ extern "C" {
 #define ISOTP_MAX_LEN 4095u
 #define ISOTP_NO_PADDING (-1)
 
+/* Largest CAN frame this build handles: 64 for CAN FD, or define it as 8
+ * for a classic-CAN-only build (smaller stack frames, FD frames ignored). */
+#ifndef ISOTP_MAX_DL
+#define ISOTP_MAX_DL 64
+#endif
+
 /* Return 0 if the frame was queued, non-zero if the TX mailbox is full; the
- * link will retry on the next isotp_poll(). len is 1..8. */
+ * link will retry on the next isotp_poll(). len is 1..8 on classic CAN; with
+ * tx_dl > 8 it may also be 12, 16, 20, 24, 32, 48 or 64, which the driver
+ * must send as a CAN FD frame (with bit-rate switching if desired). */
 typedef int (*isotp_send_fn)(void *user, uint32_t can_id, const uint8_t *data, uint8_t len);
 
 typedef enum {
@@ -60,7 +71,9 @@ typedef struct {
 
     uint8_t block_size;      /* BS we ask the peer for (0 = no limit) */
     uint8_t st_min;          /* STmin we ask the peer for, raw ISO encoding */
-    int16_t padding;         /* fill byte for short frames, or ISOTP_NO_PADDING */
+    uint8_t tx_dl;           /* TX_DL: 8 (classic, also when 0) or 12..64 (CAN FD) */
+    int16_t padding;         /* fill byte for frames up to 8 bytes, or ISOTP_NO_PADDING;
+                              * FD frames over 8 bytes are always padded (0xCC if none) */
     uint16_t n_bs_ms;        /* sender timeout waiting for FC (default 1000) */
     uint16_t n_cr_ms;        /* receiver timeout waiting for CF (default 1000) */
     uint8_t wft_max;         /* max consecutive FC.WAIT accepted (default 8) */
@@ -82,6 +95,7 @@ typedef struct {
     /* receiver */
     uint16_t rx_len, rx_off;
     uint8_t rx_state, rx_sn, rx_bs_count;
+    uint8_t rx_dl;           /* RX_DL learned from the first frame */
     uint8_t rx_fc_pending;   /* FC that could not be sent yet: 0 none, else FS+1 */
     uint32_t rx_deadline_us; /* N_Cr */
     isotp_status_t rx_status;
@@ -91,7 +105,7 @@ void isotp_init(isotp_link_t *l, const isotp_config_t *cfg);
 
 /* Starts sending len bytes. data must stay valid until the status is no
  * longer ISOTP_BUSY. Returns ISOTP_BUSY, ISOTP_DONE (single frame sent),
- * or an error. */
+ * or an error (ISOTP_ERR_INVALID also for an unsupported cfg.tx_dl). */
 isotp_status_t isotp_send(isotp_link_t *l, const uint8_t *data, uint16_t len, uint32_t now_us);
 
 void isotp_on_frame(isotp_link_t *l, const uint8_t *data, uint8_t len, uint32_t now_us);
@@ -104,6 +118,10 @@ isotp_status_t isotp_rx_status(const isotp_link_t *l);
  * receiver; the data is in cfg.rx_buf. Returns -1 if nothing is ready.
  * Any receive error is reported once through rx_status and cleared here. */
 int isotp_rx_take(isotp_link_t *l);
+
+/* Smallest valid CAN / CAN FD data length >= n (n <= 64): 0..8, 12, 16,
+ * 20, 24, 32, 48, 64. */
+uint8_t isotp_can_dl(uint8_t n);
 
 /* STmin raw byte -> microseconds. Reserved values map to 127 ms as the
  * standard requires. */
