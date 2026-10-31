@@ -1,5 +1,6 @@
 #include "vbus.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 uint32_t vbus_frame_bits(uint8_t len)
@@ -8,9 +9,39 @@ uint32_t vbus_frame_bits(uint8_t len)
     return 8u * len + 47u + (g - 1u) / 4u;
 }
 
+/* CAN FD frame, 11-bit ID, BRS, worst-case stuffing. Bits sent at the
+ * nominal rate: SOF, ID, RRS, IDE, FDF, res, BRS (stuffed), then CRC
+ * delimiter, ACK, EOF and intermission. Bits at the data rate: ESI, DLC
+ * and data (dynamically stuffed), stuff count and CRC (fixed stuff bit
+ * every four bits). */
+static void fd_frame_bits(uint8_t len, uint32_t *nominal, uint32_t *data)
+{
+    const uint32_t arb = 17u, crc = len <= 16 ? 17u : 21u, dyn = 5u + 8u * len;
+    *nominal = arb + (arb - 1u) / 4u + 1u + 2u + 7u + 3u;
+    *data = dyn + (dyn - 1u) / 4u + 4u + crc + (4u + crc + 3u) / 4u;
+}
+
+uint32_t vbus_frame_us(const vbus_t *b, uint8_t len)
+{
+    if (!b->data_bitrate) {
+        const uint64_t bits = vbus_frame_bits(len) + 3u; /* + intermission */
+        return (uint32_t)((bits * 1000000u + b->bitrate - 1u) / b->bitrate);
+    }
+    uint32_t nb, db;
+    fd_frame_bits(len, &nb, &db);
+    /* ns resolution, then round up to whole microseconds */
+    const uint64_t ns = (uint64_t)nb * 1000000000u / b->bitrate + (uint64_t)db * 1000000000u / b->data_bitrate;
+    return (uint32_t)((ns + 999u) / 1000u);
+}
+
 static int node_send(void *user, uint32_t id, const uint8_t *data, uint8_t len)
 {
     vbus_node_t *n = user;
+    /* A frame the bus cannot carry is a bug in the link, not a full mailbox. */
+    if (len == 0 || len > (n->bus->data_bitrate ? 64 : 8) || isotp_can_dl(len) != len) {
+        fprintf(stderr, "vbus: invalid frame length %u on %s bus\n", len, n->bus->data_bitrate ? "FD" : "classic");
+        abort();
+    }
     if (n->pending >= VBUS_MAILBOX)
         return -1;
     vbus_frame_t *f = &n->mailbox[n->pending++];
@@ -27,6 +58,12 @@ void vbus_init(vbus_t *b, uint32_t bitrate)
     b->tick_us = 5;
     b->poll_us = 100;
     b->busy_node = -1;
+}
+
+void vbus_init_fd(vbus_t *b, uint32_t bitrate, uint32_t data_bitrate)
+{
+    vbus_init(b, bitrate);
+    b->data_bitrate = data_bitrate;
 }
 
 vbus_node_t *vbus_attach(vbus_t *b, isotp_config_t *cfg, uint32_t rx_id)
@@ -46,7 +83,9 @@ static void trace_frame(vbus_t *b, const vbus_frame_t *f, int dropped)
 {
     if (!b->trace)
         return;
-    fprintf(b->trace, "(%4u.%06u) vcan0 %03X#", b->now_us / 1000000u, b->now_us % 1000000u, f->id);
+    /* candump log format; "##1" marks a CAN FD frame with BRS */
+    fprintf(b->trace, "(%4u.%06u) vcan0 %03X%s", b->now_us / 1000000u, b->now_us % 1000000u, f->id,
+            b->data_bitrate ? "##1" : "#");
     for (int i = 0; i < f->len; i++)
         fprintf(b->trace, "%02X", f->data[i]);
     fprintf(b->trace, "%s\n", dropped ? "   <- dropped" : "");
@@ -82,8 +121,7 @@ static void arbitrate(vbus_t *b)
     }
     if (winner < 0)
         return;
-    const uint32_t bits = vbus_frame_bits(b->nodes[winner].mailbox[0].len) + 3u; /* + intermission */
-    const uint32_t dur = (bits * 1000000u + b->bitrate - 1u) / b->bitrate;
+    const uint32_t dur = vbus_frame_us(b, b->nodes[winner].mailbox[0].len);
     b->busy_node = winner;
     b->busy_until_us = b->now_us + dur;
     b->busy_us += dur;

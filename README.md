@@ -1,8 +1,8 @@
 # isotp-lite
 
-**ISO 15765-2 (ISO-TP) transport layer for classic CAN, with a bus simulator to prove it.**
+**ISO 15765-2 (ISO-TP) transport layer for classic CAN and CAN FD, with a bus simulator to prove it.**
 
-ISO-TP is the protocol under UDS diagnostics and ECU flashing. It splits messages of up to 4095 bytes into 8-byte CAN frames, with flow control between sender and receiver. This implementation is about 300 lines of C99. It has no heap, no globals and no OS dependency. On a Cortex-M4 it compiles to **1.2 KB of code and 84 bytes of RAM per link** (`-Os`, measured in CI).
+ISO-TP is the protocol under UDS diagnostics and ECU flashing. It splits messages of up to 4095 bytes into CAN frames of 8 bytes (classic CAN) or up to 64 bytes (CAN FD), with flow control between sender and receiver. This implementation is about 350 lines of C99. It has no heap, no globals and no OS dependency. On a Cortex-M4 it compiles to **1.5 KB of code and 84 bytes of RAM per link** (`-Os`, measured in CI).
 
 [![ci](https://github.com/dusancorlija/isotp-lite/actions/workflows/ci.yml/badge.svg)](https://github.com/dusancorlija/isotp-lite/actions/workflows/ci.yml)
 
@@ -11,6 +11,7 @@ ISO-TP is the protocol under UDS diagnostics and ECU flashing. It splits message
 ## Features
 
 - Single / first / consecutive / flow-control frames, messages of 1 to 4095 bytes
+- CAN FD per ISO 15765-2:2016: configurable TX_DL (8 … 64), single frames up to 62 bytes with the SF_DL escape, RX_DL taken from each first frame, mandatory padding to valid CAN FD lengths
 - Block size and STmin, in both the millisecond and the 100 µs ranges; reserved values handled per the standard
 - STmin honoured across block boundaries, not just inside a block
 - FC.WAIT with a configurable limit, FC.OVFLW, N_Bs and N_Cr timeouts
@@ -25,7 +26,7 @@ ISO-TP is the protocol under UDS diagnostics and ECU flashing. It splits message
 
 - per-node TX mailboxes of limited depth,
 - bitwise arbitration (the lowest ID wins when the bus goes idle),
-- frame duration from the bit rate, with worst-case bit stuffing,
+- frame duration from the bit rate, with worst-case bit stuffing, for classic CAN and for CAN FD with bit-rate switching,
 - a fault-injection hook that can drop any frame on the wire,
 - a candump-compatible trace (`tools/timeline.py` turns it into the chart above).
 
@@ -50,6 +51,40 @@ How to read it:
 - STmin is the knob that trades speed for bus capacity. Block size mainly protects a slow receiver's buffer; once STmin dominates, BS costs almost nothing.
 - BS = 1 halves throughput, because every consecutive frame waits for a flow-control round trip.
 - Padding to 8 bytes only lengthens the final frame (0.2 ms per message here).
+
+## CAN FD
+
+Set `tx_dl` in the config to send CAN FD frames; leave it 0 (or 8) for classic CAN. Receiving needs no setting: the receiver takes RX_DL from each first frame, so one link talks to classic and FD peers alike.
+
+```c
+isotp_config_t cfg = { /* ... */ .tx_dl = 64 };
+```
+
+What changes on the wire (normal addressing):
+
+| Frame | Classic CAN (TX_DL 8) | CAN FD (TX_DL 12 … 64) |
+|---|---|---|
+| Single frame, 1–7 bytes | `0L` + data | same, CAN_DL ≤ 8 |
+| Single frame, 8 … TX_DL−2 bytes | — | `00 LL` + data, padded to the next CAN FD length |
+| First frame | `1L LL` + 6 bytes | `1L LL` + TX_DL−2 bytes |
+| Consecutive frame | `2N` + 7 bytes | `2N` + TX_DL−1 bytes, all but the last exactly TX_DL long |
+| Flow control | `3S BS ST` | unchanged |
+
+The `send` callback then gets lengths of 12, 16, 20, 24, 32, 48 or 64 and must send those as CAN FD frames. Frames longer than 8 bytes are always padded (with `padding`, or 0xCC if padding is off). The receiver ignores frames that break the 2016 rules: invalid CAN FD lengths, an escaped SF_DL that would have fitted a classic single frame, a first frame shorter than FF_DLmin, and consecutive frames longer than RX_DL or not using all of it.
+
+A classic-only build can define `ISOTP_MAX_DL=8`: frame buffers on the stack shrink from 64 to 8 bytes and FD frames are ignored.
+
+What CAN FD buys for a 4095-byte message (`examples/throughput.c`, receiver BS 0 and STmin 0):
+
+| Bus | TX_DL | Frames | Transfer time | Goodput |
+|---|---:|---:|---:|---:|
+| classic 500 kbit/s | 8 | 587 | 164.4 ms | 199 kbit/s |
+| FD 500 kbit/s / 2 Mbit/s | 8 | 587 | 73.4 ms | 446 kbit/s |
+| FD 500 kbit/s / 2 Mbit/s | 16 | 275 | 45.3 ms | 723 kbit/s |
+| FD 500 kbit/s / 2 Mbit/s | 64 | 67 | 26.9 ms | 1218 kbit/s |
+| FD 500 kbit/s / 5 Mbit/s | 64 | 67 | 13.5 ms | 2423 kbit/s |
+
+The data-phase bit rate helps with any frame size, but the arbitration phase and the frame trailer still run at 500 kbit/s. 64-byte frames spread that fixed cost over eight times more payload, which is where most of the remaining gain comes from.
 
 ## Firmware download over UDS
 
@@ -126,14 +161,18 @@ If `isotp_on_frame` runs in an interrupt and `isotp_poll` in a task, guard them 
 - FC.WAIT handling and the WAIT limit, a full TX mailbox, invalid and stray frames, clock wrap-around
 - simultaneous transfers in both directions
 - 200 000 random frames under ASan + UBSan
+- CAN FD: every single-frame length for each TX_DL, multi-frame boundaries per TX_DL, exact frame layout and padding, classic and FD peers in both directions at once, FD overflow, and frames that break the 2016 length rules
+- 200 000 random classic and FD frames under ASan + UBSan
 
 CI builds with GCC and Clang (`-Wall -Wextra -Wpedantic -Wconversion -Werror`) under sanitizers. It also cross-compiles for Cortex-M0+, M4 and M7:
 
 | Target | Code (`-Os`) | RAM per link |
 |---|---:|---:|
-| Cortex-M0+ | 1260 B | 84 B |
-| Cortex-M4 | 1204 B | 84 B |
-| Cortex-M7 | 1204 B | 84 B |
+| Cortex-M0+ | 1558 B | 84 B |
+| Cortex-M4 | 1460 B | 84 B |
+| Cortex-M7 | 1458 B | 84 B |
+
+With `-DISOTP_MAX_DL=8` (classic CAN only) the code is about 120 bytes smaller.
 
 ## Build
 
@@ -147,7 +186,7 @@ ctest --test-dir build --output-on-failure
 
 ## Scope
 
-Supported: normal addressing, classic CAN, 12-bit message length. Not supported: extended / mixed addressing, CAN FD frames longer than 8 bytes, and the 32-bit first-frame length escape (answered with FC.OVFLW). Each of these is a contained change in `src/isotp.c`.
+Supported: normal addressing, classic CAN and CAN FD, messages up to 4095 bytes. Not supported: extended / mixed addressing, and messages over 4095 bytes. A first frame with the 32-bit length escape is answered with FC.OVFLW when it announces more than 4095 bytes, and ignored otherwise, as ISO 15765-2:2016 requires.
 
 ## License
 

@@ -23,6 +23,12 @@ jobs:
           cmake --build build -j
       - name: Test
         run: ctest --test-dir build --output-on-failure
+      - name: Classic-only build (ISOTP_MAX_DL=8)
+        env:
+          CC: ${{ matrix.cc }}
+        run: |
+          $CC -std=c99 -DISOTP_MAX_DL=8 -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror \
+              -Iinclude -c src/isotp.c -o /dev/null
       - name: Examples
         run: |
           ./build/uds_download | tail -2

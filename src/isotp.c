@@ -7,6 +7,14 @@ enum { FS_CTS = 0, FS_WAIT = 1, FS_OVFLW = 2 };
 enum { TX_IDLE, TX_WAIT_FC, TX_SEND_CF };
 enum { RX_IDLE, RX_RECEIVING, RX_DONE };
 
+#if ISOTP_MAX_DL != 8 && ISOTP_MAX_DL != 64
+#error "ISOTP_MAX_DL must be 8 (classic CAN) or 64 (CAN FD)"
+#endif
+
+/* Fill byte for CAN FD frames over 8 bytes when the link has no padding
+ * configured: ISO 15765-2:2016 requires them padded, 0xCC recommended. */
+#define FD_FILL 0xCCu
+
 /* Wrap-safe "now has reached t" for a free-running 32-bit microsecond clock. */
 static bool reached(uint32_t now, uint32_t t) { return (int32_t)(now - t) >= 0; }
 
@@ -17,10 +25,27 @@ uint32_t isotp_stmin_to_us(uint8_t raw)
     return 127000u;
 }
 
+uint8_t isotp_can_dl(uint8_t n)
+{
+    if (n <= 8) return n;
+    if (n <= 24) return (uint8_t)((n + 3u) & ~3u); /* 12, 16, 20, 24 */
+    if (n <= 32) return 32;
+    if (n <= 48) return 48;
+    return 64;
+}
+
+static bool valid_can_dl(uint8_t n) { return n <= ISOTP_MAX_DL && isotp_can_dl(n) == n; }
+
+/* Sends f[0..used): frames up to 8 bytes are padded to 8 if configured,
+ * longer (FD) frames always up to the next valid CAN FD length. f must
+ * hold ISOTP_MAX_DL bytes. */
 static int emit(isotp_link_t *l, uint8_t *f, uint8_t used)
 {
     uint8_t len = used;
-    if (l->cfg.padding >= 0) {
+    if (used > 8) {
+        len = isotp_can_dl(used);
+        memset(f + used, l->cfg.padding >= 0 ? (uint8_t)l->cfg.padding : FD_FILL, (size_t)(len - used));
+    } else if (l->cfg.padding >= 0) {
         memset(f + used, (uint8_t)l->cfg.padding, (size_t)(8 - used));
         len = 8;
     }
@@ -29,7 +54,7 @@ static int emit(isotp_link_t *l, uint8_t *f, uint8_t used)
 
 static int send_fc(isotp_link_t *l, uint8_t fs)
 {
-    uint8_t f[8] = { (uint8_t)(PCI_FC << 4 | fs), l->cfg.block_size, l->cfg.st_min };
+    uint8_t f[ISOTP_MAX_DL] = { (uint8_t)(PCI_FC << 4 | fs), l->cfg.block_size, l->cfg.st_min };
     return emit(l, f, 3);
 }
 
@@ -40,16 +65,22 @@ void isotp_init(isotp_link_t *l, const isotp_config_t *cfg)
     if (!l->cfg.n_bs_ms) l->cfg.n_bs_ms = 1000;
     if (!l->cfg.n_cr_ms) l->cfg.n_cr_ms = 1000;
     if (!l->cfg.wft_max) l->cfg.wft_max = 8;
+    if (!l->cfg.tx_dl) l->cfg.tx_dl = 8;
 }
+
+/* Payload of a first frame / consecutive frame for a given data length. */
+static uint8_t ff_payload(uint8_t dl) { return (uint8_t)(dl - 2); }
+static uint8_t cf_payload(uint8_t dl) { return (uint8_t)(dl - 1); }
 
 /* ── transmitter ─────────────────────────────────────────────────────────── */
 
 static void tx_pump(isotp_link_t *l, uint32_t now)
 {
     while (l->tx_state == TX_SEND_CF && reached(now, l->tx_due_us)) {
-        uint8_t f[8];
+        uint8_t f[ISOTP_MAX_DL];
         const uint16_t left = (uint16_t)(l->tx_len - l->tx_off);
-        const uint8_t n = left < 7 ? (uint8_t)left : 7;
+        const uint8_t max = cf_payload(l->cfg.tx_dl);
+        const uint8_t n = left < max ? (uint8_t)left : max;
         f[0] = (uint8_t)(PCI_CF << 4 | l->tx_sn);
         memcpy(&f[1], l->tx_data + l->tx_off, n);
         if (emit(l, f, (uint8_t)(1 + n)) != 0)
@@ -78,27 +109,44 @@ isotp_status_t isotp_send(isotp_link_t *l, const uint8_t *data, uint16_t len, ui
 {
     if (l->tx_state != TX_IDLE)
         return ISOTP_BUSY;
-    if (len == 0 || len > ISOTP_MAX_LEN || (!data && len))
+    const uint8_t dl = l->cfg.tx_dl;
+    if (len == 0 || len > ISOTP_MAX_LEN || !data || dl < 8 || !valid_can_dl(dl))
         return ISOTP_ERR_INVALID;
 
-    uint8_t f[8];
+    uint8_t f[ISOTP_MAX_DL];
     if (len <= 7) {
+        /* Up to 7 bytes: classic single frame, also on a CAN FD link. */
         f[0] = (uint8_t)(PCI_SF << 4 | len);
         memcpy(&f[1], data, len);
         if (emit(l, f, (uint8_t)(1 + len)) != 0)
             return ISOTP_BUSY; /* caller may retry */
         return l->tx_status = ISOTP_DONE;
     }
+#if ISOTP_MAX_DL > 8
+    if (dl > 8 && len <= dl - 2) {
+        /* CAN FD single frame: SF_DL escape, 0x00 then an 8-bit length;
+         * emit() pads to the smallest CAN FD length that fits. */
+        f[0] = PCI_SF << 4;
+        f[1] = (uint8_t)len;
+        memcpy(&f[2], data, len);
+        if (emit(l, f, (uint8_t)(2 + len)) != 0)
+            return ISOTP_BUSY;
+        return l->tx_status = ISOTP_DONE;
+    }
+#endif
 
+    /* First frame, always a full TX_DL frame: the receiver takes RX_DL
+     * from its length. */
+    const uint8_t n = ff_payload(dl);
     f[0] = (uint8_t)(PCI_FF << 4 | (len >> 8));
     f[1] = (uint8_t)len;
-    memcpy(&f[2], data, 6);
-    if (emit(l, f, 8) != 0)
+    memcpy(&f[2], data, n);
+    if (emit(l, f, dl) != 0)
         return ISOTP_BUSY;
 
     l->tx_data = data;
     l->tx_len = len;
-    l->tx_off = 6;
+    l->tx_off = n;
     l->tx_sn = 1;
     l->tx_wft = 0;
     l->tx_state = TX_WAIT_FC;
@@ -119,7 +167,8 @@ static void on_fc(isotp_link_t *l, const uint8_t *d, uint8_t len, uint32_t now)
         l->tx_state = TX_SEND_CF;
         /* STmin separates consecutive frames, also across a block
          * boundary; the very first CF after the FF may go immediately. */
-        l->tx_due_us = (l->tx_sn == 1 && l->tx_off == 6) ? now : l->tx_last_cf_us + l->tx_st_us;
+        l->tx_due_us = (l->tx_sn == 1 && l->tx_off == ff_payload(l->cfg.tx_dl)) ? now
+                                                                                : l->tx_last_cf_us + l->tx_st_us;
         if (reached(now, l->tx_due_us))
             l->tx_due_us = now;
         tx_pump(l, now);
@@ -156,14 +205,24 @@ static void rx_flow(isotp_link_t *l, uint8_t fs)
 
 static void on_sf(isotp_link_t *l, const uint8_t *d, uint8_t len)
 {
-    const uint8_t n = d[0] & 0x0F;
-    if (n == 0 || n > 7 || len < 1 + n)
+    uint8_t n = d[0] & 0x0F, off = 1;
+    if (len > 8) {
+        /* CAN FD single frame: low nibble 0 escapes to an 8-bit SF_DL. A
+         * length that would have fitted a classic single frame is invalid. */
+        if (n != 0)
+            return;
+        n = d[1];
+        off = 2;
+        if (n < 8 || n > len - 2)
+            return;
+    } else if (n == 0 || n > 7 || len < 1 + n) {
         return;
+    }
     if (n > l->cfg.rx_cap) {
         rx_fail(l, ISOTP_ERR_OVERFLOW);
         return;
     }
-    memcpy(l->cfg.rx_buf, &d[1], n);
+    memcpy(l->cfg.rx_buf, &d[off], n);
     l->rx_len = n;
     l->rx_state = RX_DONE;
     l->rx_status = ISOTP_DONE;
@@ -171,20 +230,34 @@ static void on_sf(isotp_link_t *l, const uint8_t *d, uint8_t len)
 
 static void on_ff(isotp_link_t *l, const uint8_t *d, uint8_t len, uint32_t now)
 {
+    /* The first frame's length is RX_DL for the whole message. */
     if (len < 8)
         return;
     const uint16_t total = (uint16_t)((d[0] & 0x0F) << 8 | d[1]);
-    if (total != 0 && total < 8)
-        return; /* would have fitted a single frame: invalid */
-    if (total == 0 || total > l->cfg.rx_cap) {
-        /* total == 0 is the 32-bit length escape, not supported here */
+    if (total == 0) {
+        /* 32-bit FF_DL escape. Only legal for messages over 4095 bytes,
+         * which this build cannot hold: refuse those, ignore the rest. */
+        const uint32_t big = (uint32_t)d[2] << 24 | (uint32_t)d[3] << 16 | (uint32_t)d[4] << 8 | d[5];
+        if (big > ISOTP_MAX_LEN) {
+            rx_flow(l, FS_OVFLW);
+            rx_fail(l, ISOTP_ERR_OVERFLOW);
+        }
+        return;
+    }
+    /* Would have fitted a single frame: invalid. FF_DLmin is 8 on classic
+     * CAN and RX_DL - 1 on CAN FD. */
+    if (total < (len == 8 ? 8u : (unsigned)len - 1u))
+        return;
+    if (total > l->cfg.rx_cap) {
         rx_flow(l, FS_OVFLW);
         rx_fail(l, ISOTP_ERR_OVERFLOW);
         return;
     }
-    memcpy(l->cfg.rx_buf, &d[2], 6);
+    const uint8_t n = ff_payload(len);
+    memcpy(l->cfg.rx_buf, &d[2], n);
+    l->rx_dl = len;
     l->rx_len = total;
-    l->rx_off = 6;
+    l->rx_off = n;
     l->rx_sn = 1;
     l->rx_bs_count = 0;
     l->rx_state = RX_RECEIVING;
@@ -203,9 +276,13 @@ static void on_cf(isotp_link_t *l, const uint8_t *d, uint8_t len, uint32_t now)
     }
 
     const uint16_t left = (uint16_t)(l->rx_len - l->rx_off);
-    const uint8_t n = left < 7 ? (uint8_t)left : 7;
-    if (len < 1 + n)
-        return; /* truncated frame: ignore, N_Cr will catch a real loss */
+    const uint8_t max = cf_payload(l->rx_dl);
+    const uint8_t n = left < max ? (uint8_t)left : max;
+    /* A CF must hold the data still due (a full CF: all of RX_DL) and must
+     * not exceed RX_DL; only the last one may be shorter. Anything else is
+     * ignored, N_Cr will catch a real loss. */
+    if (len > l->rx_dl || len < 1 + n)
+        return;
 
     memcpy(l->cfg.rx_buf + l->rx_off, &d[1], n);
     l->rx_off = (uint16_t)(l->rx_off + n);
@@ -223,7 +300,7 @@ static void on_cf(isotp_link_t *l, const uint8_t *d, uint8_t len, uint32_t now)
 
 void isotp_on_frame(isotp_link_t *l, const uint8_t *data, uint8_t len, uint32_t now_us)
 {
-    if (len == 0 || len > 8)
+    if (len == 0 || !valid_can_dl(len))
         return;
     const uint8_t pci = data[0] >> 4;
 

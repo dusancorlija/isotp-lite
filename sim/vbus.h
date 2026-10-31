@@ -1,10 +1,11 @@
 /*
- * vbus.h - discrete-time classic CAN bus simulator for host tests.
+ * vbus.h - discrete-time CAN / CAN FD bus simulator for host tests.
  *
  * Models what matters for a transport protocol:
  *   - per-node TX mailboxes of limited depth (send() fails when full),
  *   - bitwise arbitration: lowest identifier wins when the bus goes idle,
- *   - frame duration from the bit rate, with worst-case bit stuffing,
+ *   - frame duration from the bit rate, with worst-case bit stuffing; on a
+ *     CAN FD bus every frame is an FD frame with bit-rate switching,
  *   - fault injection: a hook may drop any frame on the wire,
  *   - a candump-style trace.
  */
@@ -22,7 +23,7 @@
 typedef struct {
     uint32_t id;
     uint8_t len;
-    uint8_t data[8];
+    uint8_t data[64];
 } vbus_frame_t;
 
 typedef struct vbus vbus_t;
@@ -41,6 +42,7 @@ typedef int (*vbus_drop_fn)(void *user, const vbus_frame_t *f, uint32_t seq);
 
 struct vbus {
     uint32_t bitrate;
+    uint32_t data_bitrate;  /* CAN FD data phase; 0 = classic CAN bus */
     uint32_t now_us;
     uint32_t tick_us;
     uint32_t poll_us;
@@ -59,6 +61,8 @@ struct vbus {
 };
 
 void vbus_init(vbus_t *b, uint32_t bitrate);
+/* CAN FD bus: arbitration at bitrate, data phase at data_bitrate (BRS). */
+void vbus_init_fd(vbus_t *b, uint32_t bitrate, uint32_t data_bitrate);
 
 /* Registers a link; fills in cfg.send / cfg.user. Call before isotp_init. */
 vbus_node_t *vbus_attach(vbus_t *b, isotp_config_t *cfg, uint32_t rx_id);
@@ -69,5 +73,9 @@ void vbus_run_for(vbus_t *b, uint32_t duration_us);
 
 /* Classic CAN, 11-bit ID, worst-case stuffing (Davis et al., 2007). */
 uint32_t vbus_frame_bits(uint8_t len);
+
+/* Time on the wire of one frame including intermission, in microseconds
+ * (rounded up), classic or FD depending on the bus. */
+uint32_t vbus_frame_us(const vbus_t *b, uint8_t len);
 
 #endif /* VBUS_H */
