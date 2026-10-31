@@ -7,7 +7,7 @@
 import re
 import sys
 
-LINE = re.compile(r"\(\s*(\d+)\.(\d+)\)\s+\S+\s+([0-9A-F]+)#([0-9A-F]*)")
+LINE = re.compile(r"\(\s*(\d+)\.(\d+)\)\s+\S+\s+([0-9A-F]+)(?:##[0-9A-F]|#)([0-9A-F]*)")
 KIND = {0: ("SF", "#5b8def"), 1: ("FF", "#15171a"), 2: ("CF", "#e2531a"), 3: ("FC", "#2f9e6e")}
 FRAME_US = 280  # 8-byte frame incl. intermission at 500 kbit/s, for box width
 
