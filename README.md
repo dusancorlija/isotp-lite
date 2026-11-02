@@ -133,22 +133,45 @@ void diag_init(void)
     isotp_init(&diag, &cfg);
 }
 
+/* The interrupt only queues the frame; the link is driven from one context. */
 void can_rx_isr(uint32_t id, const uint8_t *data, uint8_t len)
 {
     if (id == 0x7E0)
-        isotp_on_frame(&diag, data, len, micros());
+        frame_queue_push(id, data, len);
 }
+
+/* Must outlive the transfer: isotp_send() keeps a pointer to it until the
+ * TX status is no longer ISOTP_BUSY, so it cannot be a local variable. */
+static uint8_t resp[ISOTP_MAX_LEN];
 
 void every_1ms(void)
 {
+    struct frame f;
+    while (frame_queue_pop(&f))
+        isotp_on_frame(&diag, f.data, f.len, micros());
+
     isotp_poll(&diag, micros());
+
+    /* Read the RX status before isotp_rx_take(), which clears it. */
+    const isotp_status_t rs = isotp_rx_status(&diag);
+    if (rs >= ISOTP_ERR_TIMEOUT_BS)
+        log("isotp rx: %s", isotp_status_str(rs));
+
     const int n = isotp_rx_take(&diag);
-    if (n > 0)
-        uds_handle(rx_buf, (uint16_t)n);
+    if (n > 0) {
+        const uint16_t len = uds_handle(rx_buf, (uint16_t)n, resp);
+        if (len) {
+            const isotp_status_t st = isotp_send(&diag, resp, len, micros());
+            if (st != ISOTP_BUSY && st != ISOTP_DONE)
+                log("isotp tx: %s", isotp_status_str(st));
+        }
+    }
 }
 ```
 
-If `isotp_on_frame` runs in an interrupt and `isotp_poll` in a task, guard them with the same lock or feed received frames through a queue. A link is not reentrant.
+A link is not reentrant: `isotp_on_frame`, `isotp_poll`, `isotp_send` and `isotp_rx_take` must not run concurrently. Feed received frames through a queue as above, or guard every call with the same lock (e.g. disable the CAN RX interrupt around them). Note that `isotp_on_frame` may itself transmit frames when a flow control arrives, so calling it from an interrupt also makes your `send` callback reentrant.
+
+`isotp_send` returns `ISOTP_BUSY` when a multi-frame transfer has started, but also when nothing was sent: a previous transfer is still running, or the first frame could not be queued because the TX mailbox was full. In those cases retry later; call `isotp_tx_status` first to check that the link is idle again.
 
 ## Tests
 
