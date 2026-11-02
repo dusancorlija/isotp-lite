@@ -22,7 +22,7 @@ ISO-TP is the protocol under UDS diagnostics and ECU flashing. It splits message
 
 ## The simulator
 
-`sim/vbus.c` is a discrete-time model of a classic CAN bus. It is what makes the timing behaviour testable on a laptop:
+`sim/vbus.c` is a discrete-time model of a CAN bus (classic and CAN FD). It is what makes the timing behaviour testable on a laptop:
 
 - per-node TX mailboxes of limited depth,
 - bitwise arbitration (the lowest ID wins when the bus goes idle),
